@@ -8,10 +8,14 @@ from tensorflow.keras import layers
 
 VarLabel = str
 FloatTensorLike = tf.types.experimental.TensorLike # to update when tf supports better type annotations
+TensorType = Union[tf.RaggedTensor, tf.Tensor]
+
+RESERVED = ("diag", "_flat")
+
 
 class Expression:
-    def __init__(self, tensor: tf.Tensor, free_vars: List[VarLabel]) -> None:
-        self.tensor: tf.Tensor = tensor
+    def __init__(self, tensor: TensorType, free_vars: List[VarLabel]) -> None:
+        self.tensor: TensorType = tensor
         self.free_vars: List[VarLabel] = free_vars
 
     def __repr__(self) -> str:
@@ -27,7 +31,7 @@ class Expression:
         return self.free_vars.index(free_var)
 
     def _get_dim_of_free_var(self, free_var: VarLabel) -> tf.Tensor:
-        return tf.shape(self.tensor)[self._get_axis_of_free_var(free_var)]
+        return self.tensor.shape[self._get_axis_of_free_var(free_var)]
 
     def take(self, free_var: VarLabel, indices: Union[int,List[int]]) -> Expression:
         """Take elements along the axis that corresponds to `free_var`."""
@@ -41,33 +45,40 @@ class Expression:
         result.tensor = tf.gather(self.tensor, indices, axis=self._get_axis_of_free_var(free_var))
         result.free_vars = remaining_free_vars
         return result
-        
+
+
 class Term(Expression):
-    def __init__(self, tensor: tf.Tensor, free_vars: List[VarLabel]) -> None:
+    def __init__(self, tensor: TensorType, free_vars: List[VarLabel]) -> None:
         super().__init__(tensor, free_vars=free_vars)
 
     def _copy(self) -> Term:
         return Term(self.tensor, self.free_vars.copy())
 
+
 class Formula(Expression):
-    def __init__(self, tensor: tf.Tensor, free_vars: List[VarLabel]) -> None:
+    def __init__(self, tensor: TensorType, free_vars: List[VarLabel]) -> None:
         super().__init__(tensor, free_vars=free_vars)
 
     def _copy(self) -> Formula:
         return Formula(self.tensor, self.free_vars.copy())
 
+
 class Variable(Term):
     def __init__(self, label: VarLabel, values: FloatTensorLike) -> None:
-        for reserved in ["diag","_flat"]:
+        for reserved in RESERVED:
             if label.startswith(reserved):
                 raise ValueError("Labels starting with %s are reserved." % reserved)
-        try:
-            tensor = tf.constant(values, dtype=tf.float32)
-        except TypeError:
-            tensor = tf.convert_to_tensor(tf.cast(values,tf.float32), dtype=tf.float32)
+
+        if isinstance(values, tf.RaggedTensor) or isinstance(values, tf.Tensor):
+            tensor = values
+        else:
+            try:
+                tensor = tf.constant(values, dtype=tf.float32)
+            except TypeError:
+                tensor = tf.convert_to_tensor(tf.cast(values, tf.float32), dtype=tf.float32)
         if len(tensor.shape) == 0:
             raise ValueError("LTN Variables must be list of values. The given values are not iterable.")
-        if len(tensor.shape) == 1: # ensure feature dims
+        if len(tensor.shape) == 1:  # ensure feature dims
             tensor = tensor[:, tf.newaxis]
         free_vars = [label]
         super().__init__(tensor, free_vars=free_vars)
@@ -78,7 +89,7 @@ class Variable(Term):
 
     @classmethod
     def from_constants(
-            cls: Variable, label: VarLabel, constants: List[Constant], tape: Optional[tf.GradientTape] = None
+            cls: Variable.__class__, label: VarLabel, constants: List[Constant], tape: Optional[tf.GradientTape] = None
         ) -> Variable:
         if not tape:
             warnings.warn("No instance of %s passed in argument when creating a LTN variable from constants. "\
@@ -91,6 +102,7 @@ class Variable(Term):
         variable = cls(label, dump_values)
         variable.tensor = tf.stack(as_tensors(constants))
         return variable
+
 
 class Constant(Term):
     def __init__(self, value: FloatTensorLike, trainable: bool) -> None:
@@ -109,6 +121,7 @@ class Constant(Term):
 
     def __repr__(self) -> str:
         return f"ltn.{self.__class__.__name__}(tensor={self.tensor}, trainable={self._trainable}, free_vars={self.free_vars})"
+
 
 class Proposition(Formula):
     def __init__(self, truth_value: float, trainable: bool) -> None:
@@ -130,6 +143,7 @@ class Proposition(Formula):
     def __repr__(self) -> str:
         return f"ltn.{self.__class__.__name__}(tensor={self.tensor}, trainable={self._trainable}, free_vars={self.free_vars})"
 
+
 def _flatten_free_dims(
         exprs: List[Expression], 
         in_place: bool = False
@@ -142,21 +156,27 @@ def _flatten_free_dims(
         expr.free_vars = ["_flat_"+"_".join(expr.free_vars)]
     return exprs
 
+
 class _Model:
-    def __init__(self, model: tf.keras.Model, with_feature_dims: bool) -> None:
+    def __init__(self, model: tf.keras.Model, with_feature_dims: bool, flatten: bool = False) -> None:
         self.model: tf.keras.Model = model
         self.with_feature_dims: bool = with_feature_dims
+        self.flatten = flatten
     
     def __call__(self, inputs: Union[Term, List[Term]], *args: Any, **kwargs: Any) -> Expression:
-        if not isinstance(inputs,(list,tuple)):
+        if not isinstance(inputs, (list, tuple)):
             inputs = [inputs]
-            flat_inputs = _flatten_free_dims(inputs)
-            t_outputs = self.model(flat_inputs[0].tensor, *args, **kwargs)
+            if self.flatten:
+                inputs = _flatten_free_dims(inputs)
+            t_outputs = self.model(inputs[0].tensor, *args, **kwargs)
         else:
+            # print(f"inshape 1 {[x.shape for x in as_tensors(inputs)]}")
             inputs = broadcast_exprs(inputs)
-            flat_inputs = _flatten_free_dims(inputs)
-            t_outputs = self.model(as_tensors(flat_inputs), *args, **kwargs)
-        free_dims = tf.cast(tf.shape(inputs[0].tensor)[:len(inputs[0].free_vars)],tf.int32)
+            if self.flatten:
+                inputs = _flatten_free_dims(inputs)
+            # print(f"inshape 2 {[x.shape for x in as_tensors(inputs)]}")
+            t_outputs = self.model(as_tensors(inputs), *args, **kwargs)
+        free_dims = tf.cast(tf.shape(inputs[0].tensor)[:len(inputs[0].free_vars)], tf.int32)
         if self.with_feature_dims:
             t_outputs = tf.reshape(t_outputs, tf.concat([free_dims,tf.shape(t_outputs)[1:]],axis=0))
         else:
@@ -172,6 +192,7 @@ class _Model:
                     "the weights of the layers in the %s instance have been initialized, "\
                     "for example by calling the model a first time." % tf.keras.Model)
         return self.model.trainable_variables
+
 
 class Predicate(_Model):
     def __init__(self, model: tf.keras.Model) -> None:
@@ -192,7 +213,7 @@ class Predicate(_Model):
         return wff
 
     @classmethod
-    def MLP(cls: Predicate, 
+    def MLP(cls: Predicate.__class__,
             input_shapes,
             hidden_layer_sizes=(16,16)) -> Predicate:
         inputs = [tf.keras.Input(shape) for shape in input_shapes]
@@ -205,14 +226,14 @@ class Predicate(_Model):
         return cls(model)
 
     @classmethod
-    def Lambda(cls: Predicate, lambda_operator: Callable) -> Predicate:
+    def Lambda(cls: Predicate.__class__, lambda_operator: Callable) -> Predicate:
         model = tf_LambdaModel(lambda_operator)
         return cls(model)
 
 
 class Function(_Model):
-    def __init__(self, model: tf.keras.Model) -> None:
-        super().__init__(model, with_feature_dims=True)
+    def __init__(self, model: tf.keras.Model, flatten=False) -> None:
+        super().__init__(model, flatten=flatten, with_feature_dims=True)
 
     def __call__(self, inputs: Union[Term, List[Term]], *args: Any, **kwargs: Any) -> Term:
         if not isinstance(inputs,(list,tuple)):
@@ -229,7 +250,7 @@ class Function(_Model):
         return term
 
     @classmethod
-    def MLP(cls: Function, 
+    def MLP(cls: Function.__class__,
             input_shapes, 
             output_shape, 
             hidden_layer_sizes = (16,16)) -> Function:
@@ -242,12 +263,13 @@ class Function(_Model):
         flat_outputs = layers.Dense(output_nodes)(hidden)
         outputs = layers.Reshape(output_shape)(flat_outputs)
         model = tf.keras.Model(inputs=inputs, outputs=outputs)
-        return cls(model)
+        return cls(model, flatten=True)
 
     @classmethod
-    def Lambda(cls: Function, lambda_operator: Callable) -> Function:
+    def Lambda(cls: Function.__class__, lambda_operator: Callable) -> Function:
         model = tf_LambdaModel(lambda_operator)
-        return cls(model)
+        return cls(model, flatten=True)
+
 
 class tf_LambdaModel(tf.keras.Model):
     """ Simple `tf.keras.Model` that implements a lambda layer."""
@@ -258,19 +280,23 @@ class tf_LambdaModel(tf.keras.Model):
     def call(self, inputs: Union[tf.Tensor, List[tf.Tensor]]) -> tf.Tensor:
         return self.lambda_layer(inputs)
 
+
 def diag(*variables: Variable) -> List[Variable]:
     diag_label = "diag_"+"_".join([var.label for var in variables])
     for var in variables:
         var.free_vars = [diag_label]
     return variables
 
+
 def undiag(*variables: Variable) -> List[Variable]:
     for var in variables:
         var.free_vars = [var.label]
     return variables
 
+
 def as_tensors(expressions: List[Expression]) -> List[tf.Tensor]:
     return [expr.tensor for expr in expressions]
+
 
 def broadcast_exprs(
         exprs: List[Expression], 
@@ -286,18 +312,37 @@ def broadcast_exprs(
     # broadcast
     if not in_place:
         exprs = [expr._copy() for expr in exprs]
+
+    """
+    for each expression
+        we consider the free variables present in other expressions
+        for each such free variable
+            we find the index after the last free variable
+            we add in a size-1 dimension after the last free variable dimension
+            we repeat that dimen
+            
+    Can we do this with tf.tile??
+    """
     for expr in exprs:
         free_vars_in_arg = list(expr.free_vars)
         free_vars_not_in_arg = list(set(free_vars).difference(free_vars_in_arg))
+        # expr_free_args = expr.free_vars
         for new_free_var in free_vars_not_in_arg:
             new_idx = len(free_vars_in_arg)
             expr.tensor = tf.expand_dims(expr.tensor, axis=new_idx)
-            expr.tensor = tf.repeat(expr.tensor, free_var_to_dim[new_free_var], axis=new_idx)
+            tiling = [
+                1 if i != new_idx else free_var_to_dim[new_free_var]
+                for i in range(len(expr.tensor.shape))
+            ]
+            expr.tensor = tf.tile(expr.tensor, tiling)
+            # expr.tensor = tf.repeat(expr.tensor, free_var_to_dim[new_free_var], axis=new_idx)
             free_vars_in_arg.append(new_free_var)
-        perm = [free_vars_in_arg.index(free_var) for free_var in free_vars] + list(range(len(free_vars_in_arg),len(expr.tensor.shape)))
-        expr.tensor = tf.transpose(expr.tensor, perm=perm)
-        expr.free_vars = free_vars
+        perm = [free_vars_in_arg.index(free_var) for free_var in free_vars] +\
+               list(range(len(free_vars_in_arg), len(expr.tensor.shape)))
+        # expr.tensor = tf.transpose(expr.tensor, perm=perm)
+        expr.free_vars = expr.free_vars + free_vars_not_in_arg
     return exprs
+
 
 class Wrapper_Connective:
     def __init__(self, connective_op: Callable) -> None:
@@ -318,6 +363,7 @@ class Wrapper_Connective:
             )
         result = Formula(t_result, wffs[0].free_vars)
         return result
+
 
 class Wrapper_Quantifier:
     def __init__(self, aggreg_op: Callable, semantics: str) -> None:
@@ -373,6 +419,7 @@ class Wrapper_Quantifier:
         undiag(*variables)
         return result
 
+
 class Wrapper_Formula_Aggregator:
     def __init__(self, aggreg_op: Callable) -> None:
         self.aggreg_op = aggreg_op
@@ -384,6 +431,7 @@ class Wrapper_Formula_Aggregator:
         t_result = self.aggreg_op(tf.stack(as_tensors(wffs)))
         result = Formula(t_result, free_vars=[])
         return result
+
 
 def broadcast_wff_and_mask(
         wff: Formula, 
@@ -402,6 +450,7 @@ def broadcast_wff_and_mask(
     vars_not_in_mask = [var for var in wff.free_vars if var not in mask.free_vars]
     wff = transpose_free_vars(wff, new_var_order=mask.free_vars + vars_not_in_mask)
     return wff
+
 
 def transpose_free_vars(
         expr: Expression, 
